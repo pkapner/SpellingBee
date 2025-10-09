@@ -4,8 +4,13 @@
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
+#include <algorithm>
+#include <array>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <set>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -13,6 +18,7 @@
 
 using json = nlohmann::json;
 using namespace std::chrono_literals;
+namespace fs = std::filesystem;
 
 struct HttpResponse { long status = 0; std::string body; };
 static size_t WriteToString(void* ptr, size_t size, size_t nmemb, void* userdata) {
@@ -43,6 +49,10 @@ struct CurlSession {
         HttpResponse resp; resp.body.clear();
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp.body);
+        curl_easy_setopt(curl, CURLOPT_HTTPGET, 0L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, nullptr);
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, nullptr);
+
         if (method == "GET") {
             curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
         } else if (method == "POST") {
@@ -110,6 +120,10 @@ struct WD {
                                   json{{"using","css selector"},{"value",css}});
         return j.at("value").at(kElemKey).get<std::string>();
     }
+    std::string get_element_text(const std::string& elemId) {
+        auto j = cs->request_json("GET", base + "/session/" + sessionId + "/element/" + elemId + "/text");
+        return j.at("value").is_null() ? std::string() : j.at("value").get<std::string>();
+    }
     void click_element(const std::string& elemId) {
         cs->request_json("POST", base + "/session/" + sessionId + "/element/" + elemId + "/click", json::object());
     }
@@ -175,10 +189,164 @@ static inline void to_upper_inplace(std::string& s) {
     for (auto& c : s) c = std::toupper(static_cast<unsigned char>(c));
 }
 
+static inline std::string to_lower_copy(std::string s) {
+    for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+static inline std::string trim_copy(const std::string& s) {
+    const auto not_space = [](unsigned char ch) { return !std::isspace(ch); };
+    auto begin = std::find_if(s.begin(), s.end(), not_space);
+    auto end = std::find_if(s.rbegin(), s.rend(), not_space).base();
+    if (begin >= end) return std::string();
+    return std::string(begin, end);
+}
+
+static std::string normalize_letters(const std::string& raw) {
+    std::string result;
+    result.reserve(raw.size());
+    for (char ch : raw) {
+        if (std::isspace(static_cast<unsigned char>(ch))) continue;
+        if (!std::isalpha(static_cast<unsigned char>(ch))) {
+            std::ostringstream oss;
+            oss << "letters may only contain alphabetic characters (got '" << ch << "')";
+            throw std::runtime_error(oss.str());
+        }
+        result.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+    return result;
+}
+
+struct WordDictionaries {
+    std::set<std::string> short_words;
+    std::set<std::string> medium_words;
+    std::set<std::string> extended_words;
+    std::set<std::string> massive_words;
+};
+
+static const std::array<char, 6> kVowels = {'a', 'e', 'i', 'o', 'u', 'y'};
+
+static bool contains_vowel(const std::string& word) {
+    for (char c : word) {
+        char lower = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (std::find(kVowels.begin(), kVowels.end(), lower) != kVowels.end()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void load_word_file(const fs::path& file, std::set<std::string>& out) {
+    std::ifstream in(file);
+    if (!in) {
+        std::ostringstream oss;
+        oss << "failed to open dictionary file: " << file.string();
+        throw std::runtime_error(oss.str());
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+        auto trimmed = trim_copy(line);
+        if (trimmed.empty()) continue;
+        out.insert(to_lower_copy(trimmed));
+    }
+}
+
+static WordDictionaries load_word_dictionaries(const fs::path& base_dir) {
+    WordDictionaries dictionaries;
+    load_word_file(base_dir / "wordlist.txt", dictionaries.short_words);
+    load_word_file(base_dir / "wiki-100k.txt", dictionaries.medium_words);
+    load_word_file(base_dir / "words.txt", dictionaries.extended_words);
+    load_word_file(base_dir / "words400k.txt", dictionaries.extended_words);
+    load_word_file(base_dir / "wlist_match1.txt", dictionaries.massive_words);
+    return dictionaries;
+}
+
+static std::vector<std::string> find_valid_words(const std::set<std::string>& dictionary,
+                                                 const std::string& letters) {
+    if (letters.size() < 1) {
+        throw std::runtime_error("letters input is empty");
+    }
+    const char required = letters.back();
+    std::vector<std::string> results;
+    results.reserve(dictionary.size());
+    for (const auto& word : dictionary) {
+        if (word.size() < 4) continue;
+        bool illegal = false;
+        for (char c : word) {
+            if (letters.find(c) == std::string::npos) {
+                illegal = true;
+                break;
+            }
+        }
+        if (illegal) continue;
+        if (word.find(required) == std::string::npos) continue;
+        if (!contains_vowel(word)) continue;
+        results.push_back(word);
+    }
+    return results;
+}
+
+static fs::path find_default_dictionary_dir() {
+    const std::array<fs::path, 3> candidates = {
+        fs::path("WordListerApp/target/classes/com/uestechnology"),
+        fs::path("WordListerApp/src/main/resources/com/uestechnology"),
+        fs::path("WordListerApp/extracted/com/uestechnology")
+    };
+    for (const auto& candidate : candidates) {
+        if (fs::exists(candidate) && fs::is_directory(candidate)) {
+            return candidate;
+        }
+    }
+    return {};
+}
+
+static std::string read_letters_from_board(WD& wd) {
+    std::string collected;
+    collected.reserve(7);
+    for (int idx = 1; idx <= 7; ++idx) {
+        std::ostringstream css;
+        css << ".hive-cell:nth-child(" << idx << ")";
+        const auto cell_id = wd.find_element_id_css(css.str());
+        auto text = trim_copy(wd.get_element_text(cell_id));
+        if (text.empty()) {
+            std::ostringstream oss;
+            oss << "no letter found for hive cell " << idx;
+            throw std::runtime_error(oss.str());
+        }
+        char letter = text.front();
+        if (!std::isalpha(static_cast<unsigned char>(letter))) {
+            std::ostringstream oss;
+            oss << "unexpected hive character '" << letter << "' at cell " << idx;
+            throw std::runtime_error(oss.str());
+        }
+        collected.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(letter))));
+    }
+    if (collected.size() != 7) {
+        std::ostringstream oss;
+        oss << "expected 7 hive letters but collected " << collected.size();
+        throw std::runtime_error(oss.str());
+    }
+
+    // Center letter is the fourth cell.
+    std::string reordered;
+    reordered.reserve(7);
+    char center = collected.at(3);
+    for (size_t i = 0; i < collected.size(); ++i) {
+        if (i == 3) continue;
+        reordered.push_back(collected[i]);
+    }
+    reordered.push_back(center);
+    return reordered;
+}
+
 enum class StopAction { Prompt, Keep, Rerun };
 
 struct Config {
     StopAction stop_action = StopAction::Rerun;
+    std::string letters_cli;
+    fs::path dictionary_dir;
+
+    bool has_cli_letters() const { return !letters_cli.empty(); }
 };
 
 static void print_usage(const char* prog) {
@@ -187,18 +355,26 @@ static void print_usage(const char* prog) {
               << "  --stop-action=prompt|keep|rerun  Control what happens after the run stops.\n"
               << "  --keep-open-on-stop              Shortcut for --stop-action=keep.\n"
               << "  --rerun-on-stop                  Shortcut for --stop-action=rerun.\n"
+              << "  --letters=ABCDEFg                Supply hive letters (center letter last).\n"
+              << "  --dictionary-dir=PATH           Override word list directory.\n"
               << "  -h, --help                       Show this help message.\n";
 }
 
 static Config parse_args(int argc, char** argv) {
     Config cfg;
+    cfg.dictionary_dir = find_default_dictionary_dir();
     const std::string stop_prefix = "--stop-action=";
+    const std::string letters_prefix = "--letters=";
+    const std::string dict_prefix = "--dictionary-dir=";
+
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             std::exit(0);
-        } else if (arg.rfind(stop_prefix, 0) == 0) {
+        }
+
+        if (arg.rfind(stop_prefix, 0) == 0) {
             std::string value = arg.substr(stop_prefix.size());
             if (value == "prompt") {
                 cfg.stop_action = StopAction::Prompt;
@@ -211,16 +387,56 @@ static Config parse_args(int argc, char** argv) {
                 print_usage(argv[0]);
                 std::exit(1);
             }
-        } else if (arg == "--keep-open-on-stop") {
-            cfg.stop_action = StopAction::Keep;
-        } else if (arg == "--rerun-on-stop") {
-            cfg.stop_action = StopAction::Rerun;
-        } else {
-            std::cerr << "Unknown argument: " << arg << "\n";
-            print_usage(argv[0]);
-            std::exit(1);
+            continue;
         }
+
+        if (arg == "--keep-open-on-stop") {
+            cfg.stop_action = StopAction::Keep;
+            continue;
+        }
+        if (arg == "--rerun-on-stop") {
+            cfg.stop_action = StopAction::Rerun;
+            continue;
+        }
+
+        if (arg == "--letters") {
+            if (i + 1 >= argc) {
+                std::cerr << "--letters requires a value\n";
+                print_usage(argv[0]);
+                std::exit(1);
+            }
+            cfg.letters_cli = normalize_letters(argv[++i]);
+            continue;
+        }
+        if (arg.rfind(letters_prefix, 0) == 0) {
+            cfg.letters_cli = normalize_letters(arg.substr(letters_prefix.size()));
+            continue;
+        }
+
+        if (arg == "--dictionary-dir") {
+            if (i + 1 >= argc) {
+                std::cerr << "--dictionary-dir requires a path\n";
+                print_usage(argv[0]);
+                std::exit(1);
+            }
+            cfg.dictionary_dir = fs::path(argv[++i]);
+            continue;
+        }
+        if (arg.rfind(dict_prefix, 0) == 0) {
+            cfg.dictionary_dir = fs::path(arg.substr(dict_prefix.size()));
+            continue;
+        }
+
+        std::cerr << "Unknown argument: " << arg << "\n";
+        print_usage(argv[0]);
+        std::exit(1);
     }
+
+    if (!cfg.letters_cli.empty() && cfg.letters_cli.size() != 7) {
+        std::cerr << "letters must contain exactly 7 alphabetic characters (center letter last)\n";
+        std::exit(1);
+    }
+
     return cfg;
 }
 
@@ -231,11 +447,17 @@ struct AttemptResult {
     std::string fatal_message;
 };
 
-static AttemptResult run_attempt(WD& wd, bool have_session, bool do_full_setup, int attempt_index) {
+static AttemptResult run_attempt(WD& wd,
+                                 bool have_session,
+                                 bool do_full_setup,
+                                 int attempt_index,
+                                 const Config& config,
+                                 const WordDictionaries& dictionaries) {
     AttemptResult result;
     bool quit = false;
     bool session_active = have_session;
     std::vector<std::string> words_upper;
+    std::string letters_lower;
 
     try {
         if (!session_active) {
@@ -282,28 +504,36 @@ static AttemptResult run_attempt(WD& wd, bool have_session, bool do_full_setup, 
         }
 
         if (!quit) {
-            for (;;) {
-                std::ifstream fin_test("spellingbee_filename");
-                if (fin_test) break;
-                auto r = retry_with_pause("open spellingbee_filename", [&] {
-                    std::ifstream fin_try("spellingbee_filename");
-                    if (!fin_try) throw std::runtime_error("cannot open spellingbee_filename");
+            if (config.has_cli_letters()) {
+                letters_lower = config.letters_cli;
+            } else {
+                auto r = retry_with_pause("read hive letters", [&] {
+                    letters_lower = read_letters_from_board(wd);
                 });
-                if (r == StepResult::QUIT) { quit = true; break; }
-                if (r == StepResult::SKIP) { break; }
+                if (r == StepResult::QUIT) quit = true;
+                else if (r == StepResult::SKIP) quit = true;
             }
         }
 
+        if (!quit && letters_lower.empty()) {
+            throw std::runtime_error("no hive letters available");
+        }
+
         if (!quit) {
-            std::ifstream fin("spellingbee_filename");
-            if (fin) {
-                std::string line;
-                while (std::getline(fin, line)) {
-                    if (line.empty()) continue;
-                    to_upper_inplace(line);
-                    words_upper.push_back(std::move(line));
-                }
+            auto computed = find_valid_words(dictionaries.massive_words, letters_lower);
+            words_upper.clear();
+            words_upper.reserve(computed.size());
+            for (auto word : computed) {
+                to_upper_inplace(word);
+                words_upper.push_back(std::move(word));
             }
+
+            auto letters_display = letters_lower;
+            to_upper_inplace(letters_display);
+            std::string outer = letters_display.substr(0, letters_display.size() - 1);
+            char center = letters_display.back();
+            std::cout << "\nLetters: " << outer << " (center " << center << ")";
+            std::cout << "\nGenerated " << words_upper.size() << " candidate words." << std::endl;
         }
 
         if (!quit && !words_upper.empty()) {
@@ -338,6 +568,33 @@ static AttemptResult run_attempt(WD& wd, bool have_session, bool do_full_setup, 
 // ---------- Main ----------
 int main(int argc, char** argv) {
     Config config = parse_args(argc, argv);
+
+    if (config.dictionary_dir.empty()) {
+        std::cerr << "[FATAL] Could not locate word list directory. Specify --dictionary-dir=PATH." << std::endl;
+        return 1;
+    }
+    if (!fs::exists(config.dictionary_dir) || !fs::is_directory(config.dictionary_dir)) {
+        std::cerr << "[FATAL] Dictionary directory not found: " << config.dictionary_dir << std::endl;
+        return 1;
+    }
+
+    WordDictionaries dictionaries;
+    try {
+        dictionaries = load_word_dictionaries(config.dictionary_dir);
+    } catch (const std::exception& e) {
+        std::cerr << "[FATAL] " << e.what() << std::endl;
+        return 1;
+    }
+
+    if (dictionaries.massive_words.empty()) {
+        std::cerr << "[FATAL] word list 'wlist_match1.txt' appears to be empty in "
+                  << config.dictionary_dir << std::endl;
+        return 1;
+    }
+
+    std::cout << "Loaded word lists from " << config.dictionary_dir
+              << " (massive set size: " << dictionaries.massive_words.size() << ")" << std::endl;
+
     curl_global_init(CURL_GLOBAL_DEFAULT);
     bool want_close = true;
     try {
@@ -356,7 +613,7 @@ int main(int argc, char** argv) {
             ++attempt_index;
             const bool have_session = !wd.sessionId.empty();
             bool do_full_setup = need_full_setup || !have_session;
-            AttemptResult attempt = run_attempt(wd, have_session, do_full_setup, attempt_index);
+            AttemptResult attempt = run_attempt(wd, have_session, do_full_setup, attempt_index, config, dictionaries);
 
             if (attempt.fatal_error) {
                 std::cerr << "\n[FATAL] " << attempt.fatal_message << "\n";
