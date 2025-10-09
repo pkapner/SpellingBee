@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 using json = nlohmann::json;
@@ -124,6 +125,10 @@ struct WD {
         auto j = cs->request_json("GET", base + "/session/" + sessionId + "/element/" + elemId + "/text");
         return j.at("value").is_null() ? std::string() : j.at("value").get<std::string>();
     }
+    std::string get_element_attribute(const std::string& elemId, const std::string& attribute) {
+        auto j = cs->request_json("GET", base + "/session/" + sessionId + "/element/" + elemId + "/attribute/" + attribute);
+        return j.at("value").is_null() ? std::string() : j.at("value").get<std::string>();
+    }
     void click_element(const std::string& elemId) {
         cs->request_json("POST", base + "/session/" + sessionId + "/element/" + elemId + "/click", json::object());
     }
@@ -200,6 +205,15 @@ static inline std::string trim_copy(const std::string& s) {
     auto end = std::find_if(s.rbegin(), s.rend(), not_space).base();
     if (begin >= end) return std::string();
     return std::string(begin, end);
+}
+
+static bool has_class_token(const std::string& classes_lower, const std::string& token) {
+    std::istringstream iss(classes_lower);
+    std::string part;
+    while (iss >> part) {
+        if (part == token) return true;
+    }
+    return false;
 }
 
 static std::string normalize_letters(const std::string& raw) {
@@ -300,9 +314,24 @@ static fs::path find_default_dictionary_dir() {
     return {};
 }
 
+static void dump_cell_debug(const std::vector<std::tuple<char, bool, std::string, std::string>>& cells) {
+    std::cerr << "[DEBUG] Hive cell attributes:\n";
+    int idx = 0;
+    for (const auto& entry : cells) {
+        const auto letter = std::get<0>(entry);
+        const auto is_center = std::get<1>(entry);
+        const auto& classes = std::get<2>(entry);
+        const auto& aria = std::get<3>(entry);
+        std::cerr << "  #" << (idx + 1) << " letter='" << letter
+                  << "' center=" << (is_center ? "true" : "false")
+                  << " classes='" << classes << "' aria='" << aria << "'\n";
+        ++idx;
+    }
+}
+
 static std::string read_letters_from_board(WD& wd) {
-    std::string collected;
-    collected.reserve(7);
+    std::vector<std::tuple<char, bool, std::string, std::string>> cells;
+    cells.reserve(7);
     for (int idx = 1; idx <= 7; ++idx) {
         std::ostringstream css;
         css << ".hive-cell:nth-child(" << idx << ")";
@@ -319,24 +348,77 @@ static std::string read_letters_from_board(WD& wd) {
             oss << "unexpected hive character '" << letter << "' at cell " << idx;
             throw std::runtime_error(oss.str());
         }
-        collected.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(letter))));
+        char normalized = static_cast<char>(std::tolower(static_cast<unsigned char>(letter)));
+        auto classes = wd.get_element_attribute(cell_id, "class");
+        auto aria_label = wd.get_element_attribute(cell_id, "aria-label");
+        std::string classes_lower = classes.empty() ? std::string() : to_lower_copy(classes);
+        bool is_center = false;
+        if (!classes_lower.empty()) {
+            if (has_class_token(classes_lower, "hive-cell--center") ||
+                has_class_token(classes_lower, "hive-cell_center") ||
+                has_class_token(classes_lower, "is-center") ||
+                (has_class_token(classes_lower, "center") && !has_class_token(classes_lower, "outer"))) {
+                is_center = true;
+            }
+        }
+        if (!is_center && !aria_label.empty()) {
+            auto aria_lower = to_lower_copy(aria_label);
+            if (aria_lower.find("center letter") != std::string::npos ||
+                aria_lower == "center") {
+                is_center = true;
+            }
+        }
+        cells.emplace_back(normalized, is_center, classes, aria_label);
     }
-    if (collected.size() != 7) {
+    if (cells.size() != 7) {
         std::ostringstream oss;
-        oss << "expected 7 hive letters but collected " << collected.size();
+        oss << "expected 7 hive cells but collected " << cells.size();
         throw std::runtime_error(oss.str());
     }
-
-    // Center letter is the fourth cell.
-    std::string reordered;
-    reordered.reserve(7);
-    char center = collected.at(3);
-    for (size_t i = 0; i < collected.size(); ++i) {
-        if (i == 3) continue;
-        reordered.push_back(collected[i]);
+    std::size_t center_count = 0;
+    for (const auto& entry : cells) {
+        if (std::get<1>(entry)) ++center_count;
     }
-    reordered.push_back(center);
-    return reordered;
+    if (center_count == 0) {
+        std::cerr << "[WARN] No center marker found in hive; falling back to nth-child(4)\n";
+        dump_cell_debug(cells);
+        std::get<1>(cells.at(3)) = true;
+        center_count = 1;
+    }
+    if (center_count > 1) {
+        dump_cell_debug(cells);
+        throw std::runtime_error("multiple hive cells reported as center");
+    }
+    char center_letter = '\0';
+    std::string letters;
+    letters.reserve(7);
+    for (const auto& entry : cells) {
+        const char c = std::get<0>(entry);
+        const bool is_center = std::get<1>(entry);
+        if (is_center) {
+            if (center_letter != '\0' && center_letter != c) {
+                dump_cell_debug(cells);
+                std::ostringstream oss;
+                oss << "multiple differing center letters detected (" << center_letter << " vs " << c << ")";
+                throw std::runtime_error(oss.str());
+            }
+            center_letter = c;
+        } else {
+            letters.push_back(c);
+        }
+    }
+    if (center_letter == '\0') {
+        dump_cell_debug(cells);
+        throw std::runtime_error("could not determine center hive letter after processing");
+    }
+    if (letters.size() != 6) {
+        dump_cell_debug(cells);
+        std::ostringstream oss;
+        oss << "expected 6 outer hive letters but collected " << letters.size();
+        throw std::runtime_error(oss.str());
+    }
+    letters.push_back(center_letter);
+    return letters;
 }
 
 enum class StopAction { Prompt, Keep, Rerun };
