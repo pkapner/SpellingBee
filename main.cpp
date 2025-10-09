@@ -178,7 +178,7 @@ static inline void to_upper_inplace(std::string& s) {
 enum class StopAction { Prompt, Keep, Rerun };
 
 struct Config {
-    StopAction stop_action = StopAction::Prompt;
+    StopAction stop_action = StopAction::Rerun;
 };
 
 static void print_usage(const char* prog) {
@@ -231,7 +231,7 @@ struct AttemptResult {
     std::string fatal_message;
 };
 
-static AttemptResult run_attempt(WD& wd, bool have_session, int attempt_index) {
+static AttemptResult run_attempt(WD& wd, bool have_session, bool do_full_setup, int attempt_index) {
     AttemptResult result;
     bool quit = false;
     bool session_active = have_session;
@@ -244,6 +244,7 @@ static AttemptResult run_attempt(WD& wd, bool have_session, int attempt_index) {
                 quit = true;
             } else if (r == StepResult::OK) {
                 session_active = true;
+                do_full_setup = true;
             }
         }
 
@@ -253,22 +254,23 @@ static AttemptResult run_attempt(WD& wd, bool have_session, int attempt_index) {
             return result;
         }
 
-        if (!quit) {
+        if (!quit && do_full_setup) {
             auto r = retry_with_pause("navigate", [&] { wd.navigate("https://www.nytimes.com/puzzles/spelling-bee"); });
             if (r == StepResult::QUIT) quit = true;
         }
 
-        if (!quit) {
+        if (!quit && do_full_setup) {
             auto r = retry_with_pause("resize window", [&] { wd.set_window_size(1680, 939); });
             if (r == StepResult::QUIT) quit = true;
         }
 
         if (!quit) {
-            if (attempt_index > 1) {
-                std::cout << "\n--- Rerunning word list (attempt " << attempt_index << ") ---\n";
+            if (do_full_setup) {
+                pause_banner("Browser ready? Clear modals/login, then press Enter to begin.");
+                (void)prompt_line("> ");
+            } else {
+                std::cout << "\n--- Restarting word list (attempt " << attempt_index << ") ---\n";
             }
-            pause_banner("Browser ready? Clear modals/login, then press Enter to begin.");
-            (void)prompt_line("> ");
         }
 
         if (!quit) {
@@ -348,11 +350,13 @@ int main(int argc, char** argv) {
 
         bool exit_program = false;
         int attempt_index = 0;
+        bool need_full_setup = true;
 
         while (!exit_program) {
             ++attempt_index;
             const bool have_session = !wd.sessionId.empty();
-            AttemptResult attempt = run_attempt(wd, have_session, attempt_index);
+            bool do_full_setup = need_full_setup || !have_session;
+            AttemptResult attempt = run_attempt(wd, have_session, do_full_setup, attempt_index);
 
             if (attempt.fatal_error) {
                 std::cerr << "\n[FATAL] " << attempt.fatal_message << "\n";
@@ -403,6 +407,8 @@ int main(int argc, char** argv) {
             if (attempt.fatal_error && config.stop_action != StopAction::Rerun) {
                 exit_program = true;
             }
+
+            need_full_setup = attempt.fatal_error || !attempt.session_active;
         }
 
         if (!wd.sessionId.empty() && want_close) {
