@@ -3,7 +3,13 @@ import time
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 
-driver = webdriver.Chrome()
+options = webdriver.ChromeOptions()
+# Allow ChromeDriver 111+ to attach without immediately terminating the browser.
+options.add_argument("--remote-allow-origins=*")
+# Keep Chrome running after the script finishes so results stay visible.
+options.add_experimental_option("detach", True)
+
+driver = webdriver.Chrome(options=options)
 driver.get("https://www.nytimes.com/puzzles/spelling-bee")
 driver.set_window_size(1680, 939)
 time.sleep(30)  # Sleep for 30 seconds
@@ -24,4 +30,5 @@ for test_word in f:
         position = todays_letters.find(test_word[letter_as_num_position])
         driver.find_element(By.CSS_SELECTOR, ".hive-cell:nth-child(" + str(position + 1) + ") > .cell-fill").click()
     driver.find_element(By.CSS_SELECTOR, ".hive-action__submit").click()
+    time.sleep(.01)
 f.close()
