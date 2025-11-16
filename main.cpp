@@ -316,16 +316,11 @@ static fs::path find_default_dictionary_dir() {
 
 static void dump_cell_debug(const std::vector<std::tuple<char, bool, std::string, std::string>>& cells) {
     std::cerr << "[DEBUG] Hive cell attributes:\n";
-    int idx = 0;
-    for (const auto& entry : cells) {
-        const auto letter = std::get<0>(entry);
-        const auto is_center = std::get<1>(entry);
-        const auto& classes = std::get<2>(entry);
-        const auto& aria = std::get<3>(entry);
+    for (size_t idx = 0; idx < cells.size(); ++idx) {
+        const auto& [letter, is_center, classes, aria] = cells[idx];
         std::cerr << "  #" << (idx + 1) << " letter='" << letter
                   << "' center=" << (is_center ? "true" : "false")
                   << " classes='" << classes << "' aria='" << aria << "'\n";
-        ++idx;
     }
 }
 
@@ -349,35 +344,36 @@ static std::string read_letters_from_board(WD& wd) {
             throw std::runtime_error(oss.str());
         }
         char normalized = static_cast<char>(std::tolower(static_cast<unsigned char>(letter)));
-        auto classes = wd.get_element_attribute(cell_id, "class");
-        auto aria_label = wd.get_element_attribute(cell_id, "aria-label");
-        std::string classes_lower = classes.empty() ? std::string() : to_lower_copy(classes);
+        auto classes = to_lower_copy(wd.get_element_attribute(cell_id, "class"));
+        auto aria = to_lower_copy(wd.get_element_attribute(cell_id, "aria-label"));
+
         bool is_center = false;
-        if (!classes_lower.empty()) {
-            if (has_class_token(classes_lower, "hive-cell--center") ||
-                has_class_token(classes_lower, "hive-cell_center") ||
-                has_class_token(classes_lower, "is-center") ||
-                (has_class_token(classes_lower, "center") && !has_class_token(classes_lower, "outer"))) {
+        if (!classes.empty()) {
+            if (has_class_token(classes, "hive-cell--center") ||
+                has_class_token(classes, "hive-cell_center") ||
+                has_class_token(classes, "is-center") ||
+                (has_class_token(classes, "center") && !has_class_token(classes, "outer"))) {
                 is_center = true;
             }
         }
-        if (!is_center && !aria_label.empty()) {
-            auto aria_lower = to_lower_copy(aria_label);
-            if (aria_lower.find("center letter") != std::string::npos ||
-                aria_lower == "center") {
+        if (!is_center && !aria.empty()) {
+            if (aria.find("center letter") != std::string::npos || aria == "center") {
                 is_center = true;
             }
         }
-        cells.emplace_back(normalized, is_center, classes, aria_label);
+
+        cells.emplace_back(normalized, is_center, std::move(classes), std::move(aria));
     }
+
     if (cells.size() != 7) {
         std::ostringstream oss;
         oss << "expected 7 hive cells but collected " << cells.size();
         throw std::runtime_error(oss.str());
     }
+
     std::size_t center_count = 0;
-    for (const auto& entry : cells) {
-        if (std::get<1>(entry)) ++center_count;
+    for (const auto& cell : cells) {
+        if (std::get<1>(cell)) ++center_count;
     }
     if (center_count == 0) {
         std::cerr << "[WARN] No center marker found in hive; falling back to nth-child(4)\n";
@@ -389,13 +385,13 @@ static std::string read_letters_from_board(WD& wd) {
         dump_cell_debug(cells);
         throw std::runtime_error("multiple hive cells reported as center");
     }
+
     char center_letter = '\0';
     std::string letters;
     letters.reserve(7);
-    for (const auto& entry : cells) {
-        const char c = std::get<0>(entry);
-        const bool is_center = std::get<1>(entry);
-        if (is_center) {
+    for (const auto& cell : cells) {
+        char c = std::get<0>(cell);
+        if (std::get<1>(cell)) {
             if (center_letter != '\0' && center_letter != c) {
                 dump_cell_debug(cells);
                 std::ostringstream oss;
@@ -609,32 +605,28 @@ static AttemptResult run_attempt(WD& wd,
                 to_upper_inplace(word);
                 words_upper.push_back(std::move(word));
             }
-
-            auto letters_display = letters_lower;
-            to_upper_inplace(letters_display);
-            std::string outer = letters_display.substr(0, letters_display.size() - 1);
-            char center = letters_display.back();
-            std::cout << "\nLetters: " << outer << " (center " << center << ")";
-            std::cout << "\nGenerated " << words_upper.size() << " candidate words." << std::endl;
+            std::string outer_letters = letters_lower.substr(0, letters_lower.size() - 1);
+            std::string center_letter(1, static_cast<char>(std::toupper(static_cast<unsigned char>(letters_lower.back()))));
+            std::string outer_upper = outer_letters;
+            to_upper_inplace(outer_upper);
+            std::cout << "Letters: " << outer_upper << " (center " << center_letter << ")\n";
+            std::cout << "Generated " << words_upper.size() << " candidate words.\n";
         }
 
-        if (!quit && !words_upper.empty()) {
-            auto r = retry_with_pause("send_all_words_as_keys", [&] { wd.send_all_words_as_keys(words_upper); });
+        if (!quit) {
+            auto r = retry_with_pause("send words", [&] {
+                wd.send_all_words_as_keys(words_upper);
+            });
             if (r == StepResult::QUIT) quit = true;
-        }
-
-        if (!quit && !words_upper.empty()) {
-            std::cout << "\nAll done typing.\n";
-        } else if (!quit && words_upper.empty()) {
-            std::cout << "\nNo words found to send.\n";
         }
 
         result.session_active = !wd.sessionId.empty();
         result.user_quit = quit;
+        result.fatal_error = false;
         return result;
     } catch (const std::exception& e) {
         result.session_active = !wd.sessionId.empty();
-        result.user_quit = false;
+        result.user_quit = quit;
         result.fatal_error = true;
         result.fatal_message = e.what();
         return result;
